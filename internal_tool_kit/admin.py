@@ -1,10 +1,12 @@
-"""Account management inside the application: create, change role, deactivate or re-enable, reset a password.
+"""Account management inside the application: create, rename, change role, deactivate or re-enable, reset a
+password, sign out of all devices.
 
 Every operation checks, in this order: the actor holds the management permission; the target is below the actor
-(:meth:`Roles.require_manage`); a new role is one the actor may give; the audit log is writable. Only then does it
-change the account and record the change. Deactivating, demoting and resetting take effect on the target's open
-sessions at once, because :func:`sessions.current_account` reads the account on every request (a reset also
-increases the password version). Re-enabling and resetting lift a login pause.
+(:meth:`Roles.require_manage`); a new role is one the actor may give. Then it records the change in the audit log
+(which refuses if the log cannot be written) and makes it (:meth:`AuditLog.change`). Deactivating, demoting,
+resetting and signing out take effect on the target's open sessions at once, because
+:func:`sessions.current_account` reads the account on every request (a reset increases the password version, a
+sign-out the session version). Re-enabling and resetting lift a login pause.
 
 Temporary passwords are returned once and never stored or logged; hand them over in person or by another safe
 channel. The account must change it at the next login.
@@ -13,13 +15,14 @@ channel. The account must change it at the next login.
 from __future__ import annotations
 
 from internal_tool_kit import passwords
-from internal_tool_kit.accounts import Account, AccountStore
+from internal_tool_kit.accounts import Account, AccountStore, check_username
 from internal_tool_kit.audit import AuditLog
 from internal_tool_kit.i18n import KitError
 from internal_tool_kit.roles import Roles
 
-CREATE, ROLE, DEACTIVATE, ACTIVATE, PASSWORD_RESET = (
-    "account.create", "account.role", "account.deactivate", "account.activate", "account.password_reset")
+CREATE, RENAME, ROLE, DEACTIVATE, ACTIVATE, PASSWORD_RESET, SESSIONS_END = (
+    "account.create", "account.rename", "account.role", "account.deactivate", "account.activate",
+    "account.password_reset", "account.sessions_end")
 
 
 class AccountAdmin:
@@ -42,15 +45,31 @@ class AccountAdmin:
         return self.roles.visible(self.store.all(fresh=True), actor)
 
     def create(self, actor: Account, username: str, display_name: str, role: str) -> tuple[Account, str]:
+        """A new account with a temporary password (returned once). The new id is not known before the account
+        exists, so the entry names the username, which is unique."""
         self.roles.require(actor, self.permission)
         self.roles.require_assignable(actor, role)
-        self.audit.ensure_ready()
+        name = check_username(username)
         temp = passwords.temporary_password()
-        account = self.store.create(username, display_name, role, passwords.hash_password(temp, self.hasher),
-                                    must_change_password=True)
-        self.audit.record(actor.account_id, CREATE, self.store.table, account.account_id,
-                          f"{account.username} as {role}")
+        with self.audit.change(actor.account_id, CREATE, self.store.table, "", f"{name} as {role}"):
+            account = self.store.create(name, display_name, role, passwords.hash_password(temp, self.hasher),
+                                        must_change_password=True)
         return account, temp
+
+    def rename(self, actor: Account, target_id, username: str) -> Account:
+        target = self._target(actor, target_id)
+        name = check_username(username)
+        with self.audit.change(actor.account_id, RENAME, self.store.table, target.account_id,
+                               f"{target.username} -> {name}"):
+            account = self.store.rename(target.account_id, name)
+        return account
+
+    def end_sessions(self, actor: Account, target_id) -> Account:
+        """Sign the target out of every device (for example after a lost phone)."""
+        target = self._target(actor, target_id)
+        with self.audit.change(actor.account_id, SESSIONS_END, self.store.table, target.account_id):
+            account = self.store.end_sessions(target.account_id)
+        return account
 
     def set_role(self, actor: Account, target_id, role: str) -> Account:
         target = self._target(actor, target_id)

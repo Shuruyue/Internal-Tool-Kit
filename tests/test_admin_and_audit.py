@@ -131,13 +131,46 @@ def test_a_missing_audit_table_blocks_the_change(world):
     assert store.get(member.account_id) == member and len(store.all()) == 2
 
 
-def test_the_change_context_records_only_after_success(world):
+def test_the_change_is_recorded_first_and_a_failure_is_recorded_too(world):
     log = world["log"]
-    with pytest.raises(RuntimeError), log.change("1", "item.close", "items", "9"):
-        raise RuntimeError("the change failed")
-    assert log.entries() == []
-    with log.change("1", "item.close", "items", "9", "done"):
-        pass
-    assert log.entries()[0]["detail"] == "done"
-    assert log.record(None, "account.password_reset", "accounts", "5", "break-glass by the data owner") == "2"
-    assert log.entries(actor_id="")[0]["action"] == "account.password_reset"
+    with pytest.raises(RuntimeError), log.change("1", "item.close", "items", "9", "closing"):
+        assert [e["action"] for e in log.entries()] == ["item.close"]     # written before the block runs
+        raise RuntimeError("secret detail 0912345678")
+    failed, intent = log.entries()
+    assert (intent["action"], intent["detail"]) == ("item.close", "closing")
+    assert (failed["action"], failed["detail"]) == ("item.close.failed", "failed: RuntimeError")  # no message text
+    with pytest.raises(KitError), log.change("1", "item.close", "items", "9"):
+        raise KitError("roles.forbidden")
+    assert log.entries()[0]["detail"] == "failed: roles.forbidden"
+
+
+def test_record_returns_a_unique_id_led_by_the_time(world):
+    log = world["log"]
+    ids = [log.record(None, "account.password_reset", "accounts", "5", "break-glass by the data owner")
+           for _ in range(50)]
+    times = [i.split("-")[0] for i in ids]
+    assert len(set(ids)) == 50 and times == sorted(times)
+    assert log.entries(actor_id="")[0]["log_id"] == ids[-1]
+
+
+def test_admin_create_rename_and_sign_out_are_logged(world):
+    admin, owner = world["admin"], who(world, "owner")
+    account, _ = admin.create(owner, " NewBie ", "Newbie", "member")
+    admin.rename(owner, account.account_id, "new.bie")
+    renamed = admin.end_sessions(owner, account.account_id)
+    assert (renamed.username, renamed.session_version) == ("new.bie", 2)
+    actions = [(e["action"], e["target_id"], e["detail"]) for e in world["log"].entries()]
+    assert actions == [("account.sessions_end", account.account_id, ""),
+                       ("account.rename", account.account_id, "newbie -> new.bie"),
+                       ("account.create", "", "newbie as member")]
+    expect("roles.cannot_manage", admin.rename, who(world, "mgr"), who(world, "mgr2").account_id, "x.y.z")
+    expect("roles.cannot_manage", admin.end_sessions, who(world, "mgr"), who(world, "owner").account_id)
+    expect("accounts.username_taken", admin.rename, owner, account.account_id, "member")
+    assert who(world, "member").username == "member"
+
+
+def test_a_refused_creation_leaves_a_failed_entry_and_no_account(world):
+    admin, owner = world["admin"], who(world, "owner")
+    expect("accounts.username_taken", admin.create, owner, "member", "Second Member", "member")
+    assert [e["action"] for e in world["log"].entries()] == ["account.create.failed", "account.create"]
+    assert len(world["store"].all()) == 6
