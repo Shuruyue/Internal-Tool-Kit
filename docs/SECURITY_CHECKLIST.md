@@ -9,14 +9,17 @@ Go through this before other people use the tool. Each item is a rule and the re
 - [ ] **Repeated failures pause sign-in for a while; they do not lock the account for good.** A permanent lock lets anyone who knows a username shut its owner out, all administrators at once if their names are known. An administrator can lift a pause early. (`login`)
 - [ ] **Passwords are hashed with a slow, salted function** (scrypt, Argon2id or bcrypt), never stored or compared in plain text. (`passwords`)
 - [ ] **Passwords have an upper length**, and the form says so. bcrypt cannot use more than 72 bytes and recent versions raise an error, which crashes a page that does not expect it. (`passwords`)
-- [ ] **Changing one's own password asks for the current one.** An unattended session must not be enough to take over the account. (`login`)
-- [ ] **A forgotten password at the top role has a planned way back**: someone outside the application who holds the data credentials issues a temporary password that must be changed at the next login, and the reset is logged. (`accounts.reset_password`)
+- [ ] **One place cannot try a password on every username.** A per-username pause does not stop one common password tried once on many usernames; count failures per client as well. (`login.authenticate(client=...)`)
+- [ ] **Changing one's own password asks for the current one, and wrong guesses are paused.** An unattended session must not be enough to take over the account, by changing the password or by trying passwords until one fits. (`login.new_password_hash(throttle=...)`)
+- [ ] **A forgotten password at the top role has a planned way back**: someone outside the application who holds the data credentials issues a temporary password that must be changed at the next login, and the reset is recorded in the audit log, with who did it and why, before it is made. (`accounts.reset_password(audit=..., reason=...)`)
+- [ ] **Usernames change only through a rename that checks them** like a new one (format, uniqueness) and is logged. (`accounts.AccountStore.rename`, `admin`)
 
 ## Sessions
 
 - [ ] **The account is read again on every request.** Deactivating, demoting or resetting an account must take effect on its open sessions at once, not at its next login. (`sessions.current_account`)
 - [ ] **"Stay signed in" tokens name the account by id and carry its password version.** Bound to a username, a token signs in whoever gets that name after a rename; without the version, a changed password leaves old devices signed in. (`sessions`)
 - [ ] **Tokens are signed with a long random secret, expire, and are stored in an HttpOnly, Secure cookie** where the framework allows it. (`sessions`)
+- [ ] **People can sign out of all devices, and a manager can do it for them** (a lost phone, a shared computer). Signing out on one device only deletes that device's cookie; a copied token keeps working until it expires. (`AccountStore.end_sessions`, `AccountAdmin.end_sessions`)
 
 ## Permissions
 
@@ -32,14 +35,14 @@ Go through this before other people use the tool. Each item is a rule and the re
 - [ ] **Closed records are read-only**, in the service layer and on the page, except for what closing itself produces. Reopening is a separate action for a higher role, with a reason, and is logged.
 - [ ] **Closing checks for unfinished business**: items waiting for someone's confirmation cannot be closed over, or they stay pending forever.
 - [ ] **Confirmation dialogs carry the id of the record they were opened for**, and refuse to act if the page has moved to another record. A dialog that keeps its data while the user switches records can apply it to the wrong one.
-- [ ] **Editing a record does not silently change fields the user did not touch** (for example setting an end date to today on every save).
-- [ ] **Handing a record to another owner asks for confirmation**, keeps the previous owner as a collaborator, and is logged; a manager can reassign records of a deactivated owner.
+- [ ] **Editing a record does not silently change fields the user did not touch** (for example a date reset on every save).
+- [ ] **Handing a record to another owner asks for confirmation** and is logged; a manager can reassign records of a deactivated owner.
 - [ ] **Deletion is a "void" with a reason**, not a removal, where history matters.
 
 ## Audit log
 
 - [ ] **Changes to accounts, roles and record status are always logged**: who, what, which record, when, why. (`audit`)
-- [ ] **The log is checked before the change**, so that a missing log blocks the change instead of letting it pass unrecorded. (`audit.ensure_ready`)
+- [ ] **The entry is written before the change**, so that a missing or unwritable log blocks the change instead of letting it pass unrecorded; a change that then fails gets a second entry. (`audit.change`)
 - [ ] **The log table is protected** so that only the application's service account can edit it (a protected range in Google Sheets). The application offers no edit or delete. (`audit`)
 - [ ] **No password, temporary password, token or key ever goes into the log.**
 
@@ -50,11 +53,12 @@ Go through this before other people use the tool. Each item is a rule and the re
 - [ ] **Development, tests and AI assistants use a copy**, never the production spreadsheet. See [DATA_CHANGES.md](DATA_CHANGES.md). (`storage.require_test_data`)
 - [ ] **New ids are taken from fresh data under the same lock as the insert.** A cached read lets two users get the same number. (`storage.insert`)
 - [ ] **Values are written as text** (Google Sheets: RAW; Excel: string cells), so a user cannot plant a formula; exports to CSV escape formula-like cells. (`storage`, `storage.escape_formula`)
+- [ ] **Reads fit the quota.** Google Sheets allows the whole application (one service account) 60 read requests a minute. Create the storage once per process, and let session checks and page reads reuse a read for a few seconds (`max_age`) when many people use the tool; see [ARCHITECTURE.md](ARCHITECTURE.md). (`storage`)
 - [ ] **A spreadsheet has no transactions.** Two servers, or a person typing in the sheet, can still race the application. Plan the move to a database when users or data grow.
 
 ## Secrets
 
-- [ ] **No key, token or password is in the repository**, in its history, in a zip file next to the code, or in a chat message. `.gitignore` covers `secrets/`, `*.zip`, `.env`, key and credential files.
+- [ ] **No key, token or password is in the repository**, in its history, in an archive or a copied folder next to the code, or in a chat message. `.gitignore` covers `secrets/`, `*.zip`, `.env`, key and credential files.
 - [ ] **Keys live in the deployment platform's secret store** and are given to people who need them, not to everyone who clones the code.
 - [ ] **A key that was ever committed is rotated**, not just deleted: removing it from the latest commit leaves it in the history and in every clone.
 - [ ] **Keys are rotated on a schedule** (Google suggests at most 90 days for service-account keys) and whenever someone with access leaves.
@@ -62,7 +66,7 @@ Go through this before other people use the tool. Each item is a rule and the re
 ## Pages and output
 
 - [ ] **User input is escaped before it is put into HTML.** Only markup the program generates itself is rendered as HTML.
-- [ ] **Real data is blurred before demos, screenshots or AI prompts.** A "sample project" adapted from a real case still names a real client. (`redaction`)
+- [ ] **Real data is blurred before demos, screenshots or AI prompts.** Example data adapted from a real case can still identify real people or clients. (`redaction`)
 - [ ] **Personal and client data is replaced before text goes to an outside AI service**, and people can see what will be sent. (`redaction`, `ai.prepare`)
 
 ## Code and repository
