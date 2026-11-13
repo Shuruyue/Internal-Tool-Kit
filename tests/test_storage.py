@@ -172,3 +172,130 @@ def test_production_storage_is_refused_by_test_tools(tmp_path):
                                            ("\tx", "'\tx"), ("plain", "plain"), ("a=b", "a=b"), ("", "")])
 def test_escape_formula_for_csv_exports(text, escaped):
     assert escape_formula(text) == escaped
+
+
+def test_ids_ignore_digits_that_are_not_plain_integers(store):
+    store.append("items", {"item_id": "²", "name": "superscript"})     # str.isdigit() would accept it
+    store.append("items", {"item_id": " 7 ", "name": "spaces"})
+    store.append("items", {"item_id": "3.0", "name": "float"})
+    assert store.insert("items", {"name": "next"}, "item_id") == "8"
+
+
+def test_storage_objects_of_the_same_data_share_one_lock(tmp_path):
+    book = FakeSpreadsheet(TABLES)
+    assert SheetsStorage(book).lock is SheetsStorage(book).lock
+    assert SheetsStorage(book).lock is not SheetsStorage(FakeSpreadsheet(TABLES)).lock
+    path = tmp_path / "data.xlsx"
+    first = ExcelStorage.create(path, TABLES)
+    assert ExcelStorage(path).lock is first.lock
+    assert ExcelStorage(tmp_path / "." / "data.xlsx").lock is first.lock
+    assert MemoryStorage(TABLES).lock is not MemoryStorage(TABLES).lock
+
+
+def test_two_storage_objects_of_one_spreadsheet_give_distinct_ids(monkeypatch):
+    # one storage object per user session must not weaken the lock: slow reads widen any race
+    import time
+
+    from .fake_gspread import FakeWorksheet
+
+    real = FakeWorksheet.get_all_values
+    monkeypatch.setattr(FakeWorksheet, "get_all_values", lambda self: (time.sleep(0.005), real(self))[1])
+    book = FakeSpreadsheet(TABLES)
+    ids = []
+
+    def work():
+        session_storage = SheetsStorage(book, production=False)
+        for _ in range(5):
+            ids.append(session_storage.insert("items", {"name": "x"}, "item_id"))
+
+    threads = [threading.Thread(target=work) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(ids, key=int) == [str(i) for i in range(1, 21)]
+
+
+def test_sheets_requests_per_operation():
+    book = FakeSpreadsheet(TABLES)
+    store = SheetsStorage(book, production=False)
+    store.read("items")                                  # first use lists the worksheets once
+    for operation, reads, writes in [
+        (lambda: store.read("items"), 1, 0),
+        (lambda: store.read("items", require=["item_id", "name", "note"]), 1, 0),
+        (lambda: store.require_columns("items", ["item_id", "name", "owner_id", "note"]), 1, 0),   # header row
+        (lambda: store.append("items", {"name": "a"}), 1, 1),                                     # header row
+        (lambda: store.insert("items", {"name": "b"}, "item_id"), 1, 1),
+        (lambda: store.update("items", "item_id", "1", {"note": "n"}), 1, 1),
+    ]:
+        book.reset_counts()
+        operation()
+        assert book.requests == {"read": reads, "write": writes}
+
+
+def test_max_age_reuses_a_read_within_its_age(monkeypatch):
+    import internal_tool_kit.storage as storage_module
+
+    now = [100.0]
+    monkeypatch.setattr(storage_module.time, "monotonic", lambda: now[0])
+    book = FakeSpreadsheet(TABLES)
+    store = SheetsStorage(book, production=False)
+    store.read("items")
+    book.reset_counts()
+    store.read("items", max_age=5)
+    store.columns("items", max_age=5)
+    assert book.requests["read"] == 0
+    now[0] += 5
+    store.read("items", max_age=5)
+    assert book.requests["read"] == 1
+    store.read("items", max_age=5, fresh=True)           # fresh wins
+    assert book.requests["read"] == 2
+
+
+def test_sheets_retries_reads_after_quota_and_server_errors():
+    waits = []
+    book = FakeSpreadsheet(TABLES)
+    store = SheetsStorage(book, production=False, sleep=waits.append)
+    store.read("items")
+    book.fail(429, 503)
+    assert store.read("items") == []
+    assert len(waits) == 2 and 1 <= waits[0] < 2 and 2 <= waits[1] < 3
+    book.fail(403)                                       # not retryable: raised at once
+    with pytest.raises(Exception, match="HTTP 403"):
+        store.read("items")
+    assert len(waits) == 2
+
+
+def test_sheets_retries_a_write_only_after_a_quota_refusal():
+    waits = []
+    book = FakeSpreadsheet(TABLES)
+    store = SheetsStorage(book, production=False, sleep=waits.append)
+    store.read("items")
+    sheet = book.sheets["items"]
+    real_append = sheet.append_row
+    outcomes = iter([429, None])
+
+    def append_once_refused(*args, **kwargs):
+        code = next(outcomes)
+        if code:
+            from .fake_gspread import FakeAPIError
+            raise FakeAPIError(code)
+        return real_append(*args, **kwargs)
+
+    sheet.append_row = append_once_refused
+    store.append("items", {"name": "a"})
+    assert [r["name"] for r in store.read("items")] == ["a"] and len(waits) == 1
+    outcomes = iter([503])
+    with pytest.raises(Exception, match="HTTP 503"):     # may have happened: never repeated
+        store.append("items", {"name": "b"})
+
+
+def test_retries_give_up_after_the_limit_with_capped_waits():
+    waits = []
+    book = FakeSpreadsheet(TABLES)
+    store = SheetsStorage(book, production=False, retries=7, max_backoff=10, sleep=waits.append)
+    store.read("items")
+    book.fail(*[429] * 8)
+    with pytest.raises(Exception, match="HTTP 429"):
+        store.read("items")
+    assert len(waits) == 7 and max(waits) == 10

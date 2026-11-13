@@ -15,7 +15,11 @@ What the base class guarantees, whatever the backend:
 
 - **Fresh data for writes.** :meth:`Storage.insert` allocates the next id from freshly read rows and appends the
   row under the same lock, so two inserts in one process never get the same id (a cached read would let them).
-  :meth:`Storage.update` also locates its row in fresh data. Reads may use a short cache (``cache_seconds``).
+  :meth:`Storage.update` also locates its row in fresh data.
+- **One lock per spreadsheet or file.** Every storage object of the same Google spreadsheet (by its id) or the same
+  workbook (by its path) in one process shares one lock, so creating a storage object per user session does not
+  weaken it. Two processes, or a person typing in the spreadsheet at the same time, can still race: a spreadsheet
+  has no transactions, which is the main reason to move to a database as an application grows.
 - **No silent data loss.** Writing a column the table does not have, updating a key that matches no row or more
   than one row, and reading a table that is missing or has a malformed header all raise :class:`KitError`.
 - **Text stays text.** A value that starts with ``=``, ``+``, ``-`` or ``@`` is stored as text, never as a formula
@@ -24,16 +28,20 @@ What the base class guarantees, whatever the backend:
 - **Production is marked.** ``storage.production`` says whether the backend holds real data;
   :func:`require_test_data` lets tools that write fake data or switch identities refuse to run on it.
 
-The lock is per process. Two servers, or a person typing in the spreadsheet at the same time, can still race;
-a spreadsheet has no transactions, which is the main reason to move to a database as an application grows.
+**Reads and the Google Sheets quota.** Every read of a table is one request to the backend, and Google allows a
+service account 60 read requests a minute per project. A read may therefore reuse a recent copy: ``max_age``
+(seconds; default ``cache_seconds`` of the storage, 0 unless set) says how old it may be, and ``fresh=True`` means
+``max_age=0``. Writes never use a copy. Checking columns (:meth:`Storage.require_columns`, ``read(require=...)``)
+costs no extra request, or reads only the header row.
 """
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Hashable, Iterable
 
 from internal_tool_kit.i18n import KitError, register
 
@@ -52,6 +60,18 @@ register("storage.production_refused", "This tool only runs on test data, and th
          "此工具只能用於測試資料，目前連接的是正式資料。")
 
 FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+_INTEGER = re.compile(r"-?[0-9]+")
+
+_LOCKS: dict[Hashable, threading.RLock] = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def shared_lock(key: Hashable | None) -> threading.RLock:
+    """The process-wide lock for ``key`` (for example ``("sheets", spreadsheet_id)``); a new lock for None."""
+    if key is None:
+        return threading.RLock()
+    with _LOCKS_GUARD:
+        return _LOCKS.setdefault(key, threading.RLock())
 
 
 def cell(value) -> str:
@@ -72,66 +92,77 @@ def require_test_data(storage: Storage) -> None:
 
 
 class Storage(ABC):
-    """The interface; subclasses implement only the four primitives at the bottom."""
+    """The interface; subclasses implement only the primitives at the bottom.
 
-    def __init__(self, *, production: bool, cache_seconds: float = 0.0):
+    ``lock_key`` names what the data lives in (a spreadsheet id, a file path): storage objects with the same key
+    share one lock. None gives the object a lock of its own."""
+
+    def __init__(self, *, production: bool, cache_seconds: float = 0.0, lock_key: Hashable | None = None):
         self.production = production
         self.cache_seconds = cache_seconds
-        self._lock = threading.RLock()
+        self._lock = shared_lock(lock_key)
         self._cache: dict[str, tuple[float, list[str], list[tuple[int, list[str]]]]] = {}
 
     @property
     def lock(self) -> threading.RLock:
-        """The storage's lock (re-entrant). Hold it around a read-check-write sequence of your own, such as
-        "the username is free, then insert", so that no other write of this process comes in between."""
+        """The storage's lock (re-entrant, shared with every storage object of the same data in this process).
+        Hold it around a read-check-write sequence of your own, such as "the username is free, then insert", so
+        that no other write of this process comes in between."""
         return self._lock
 
     # ----------------------------------------------------------------------------------------- reading
-    def columns(self, table: str) -> list[str]:
-        return list(self._load(table, fresh=False)[0])
+    def columns(self, table: str, *, max_age: float | None = None) -> list[str]:
+        """The column names of ``table``: from a copy at most ``max_age`` seconds old, else from the header row."""
+        hit = self._cached(table, self._max_age(False, max_age))
+        if hit is not None:
+            return list(hit[0])
+        if not self._has_table(table):
+            raise KitError("storage.missing_table", table=table)
+        return self._clean_header(table, [cell(v) for v in self._read_header(table)])
 
-    def read(self, table: str, *, fresh: bool = False) -> list[dict[str, str]]:
-        """Every row of ``table`` as {column: text}; ``fresh`` skips the cache."""
-        header, rows = self._load(table, fresh=fresh)
+    def read(self, table: str, *, fresh: bool = False, max_age: float | None = None,
+             require: Iterable[str] = ()) -> list[dict[str, str]]:
+        """Every row of ``table`` as {column: text}. ``fresh`` (or ``max_age=0``) reads the backend; ``require``
+        raises ``storage.missing_columns`` unless the table has those columns (checked on the same read)."""
+        header, rows = self._load(table, max_age=self._max_age(fresh, max_age))
+        self._check_required(table, header, require)
         return [dict(zip(header, values, strict=True)) for _, values in rows]
 
-    def find(self, table: str, column: str, value, *, fresh: bool = False) -> list[dict[str, str]]:
-        self._check_known(table, [column])
-        value = cell(value)
-        return [r for r in self.read(table, fresh=fresh) if r[column] == value]
+    def find(self, table: str, column: str, value, *, fresh: bool = False,
+             max_age: float | None = None) -> list[dict[str, str]]:
+        header, rows = self._load(table, max_age=self._max_age(fresh, max_age))
+        self._check_known(table, [column], header)
+        index, value = header.index(column), cell(value)
+        return [dict(zip(header, v, strict=True)) for _, v in rows if v[index] == value]
 
     def require_columns(self, table: str, columns: Iterable[str]) -> None:
         """Raise unless ``table`` exists and has every column in ``columns`` (check before a feature relies on it)."""
-        missing = [c for c in columns if c not in self.columns(table)]
-        if missing:
-            raise KitError("storage.missing_columns", table=table, columns=", ".join(missing))
+        self._check_required(table, self.columns(table), columns)
 
     # ----------------------------------------------------------------------------------------- writing
-    def append(self, table: str, row: dict) -> dict[str, str]:
-        """Append ``row`` (missing columns are left empty) and return it as stored."""
+    def append(self, table: str, row: dict, *, require: Iterable[str] = ()) -> dict[str, str]:
+        """Append ``row`` (missing columns are left empty) and return it as stored. Reads only the header row."""
         with self._lock:
-            header, _ = self._load(table, fresh=True)
-            values = self._values(table, header, row)
-            self._append_values(table, values)
-            self._cache.pop(table, None)
-            return dict(zip(header, values, strict=True))
+            header = self.columns(table, max_age=0)
+            self._check_required(table, header, require)
+            return self._append_row(table, header, row)
 
     def insert(self, table: str, row: dict, id_column: str) -> str:
         """Append ``row`` with ``id_column`` set to one more than the largest integer id in the table; returns the
         new id. Reading the ids and appending happen under one lock, on fresh data."""
         with self._lock:
-            header, rows = self._load(table, fresh=True)
+            header, rows = self._load(table, max_age=0)
             self._check_known(table, [id_column], header)
             index = header.index(id_column)
-            ids = [int(v[index]) for _, v in rows if v[index].strip().lstrip("-").isdigit()]
+            ids = [int(v[index].strip()) for _, v in rows if _INTEGER.fullmatch(v[index].strip())]
             new_id = str(max(ids, default=0) + 1)
-            self.append(table, {**row, id_column: new_id})
+            self._append_row(table, header, {**row, id_column: new_id})
             return new_id
 
     def update(self, table: str, key_column: str, key, values: dict) -> dict[str, str]:
         """Change ``values`` in the one row whose ``key_column`` equals ``key``; returns the row as stored."""
         with self._lock:
-            header, rows = self._load(table, fresh=True)
+            header, rows = self._load(table, max_age=0)
             self._check_known(table, [key_column, *values], header)
             index, key = header.index(key_column), cell(key)
             hits = [(n, v) for n, v in rows if v[index] == key]
@@ -146,42 +177,70 @@ class Storage(ABC):
             return dict(zip(header, new, strict=True))
 
     # ----------------------------------------------------------------------------------------- helpers
-    def _load(self, table: str, *, fresh: bool) -> tuple[list[str], list[tuple[int, list[str]]]]:
-        """(header, [(sheet row number, values padded to the header)]); rows that are entirely empty are skipped."""
+    def _max_age(self, fresh: bool, max_age: float | None) -> float:
+        if fresh:
+            return 0.0
+        return self.cache_seconds if max_age is None else max_age
+
+    def _cached(self, table: str, max_age: float):
+        hit = self._cache.get(table)
+        if hit and max_age > 0 and time.monotonic() - hit[0] < max_age:
+            return hit[1], hit[2]
+        return None
+
+    def _clean_header(self, table: str, raw: list[str]) -> list[str]:
+        header = list(raw)
+        while header and not header[-1].strip():
+            header.pop()
+        if not header or any(not c.strip() for c in header) or len(set(header)) != len(header):
+            raise KitError("storage.bad_header", table=table)
+        return header
+
+    def _load(self, table: str, *, max_age: float) -> tuple[list[str], list[tuple[int, list[str]]]]:
+        """(header, [(sheet row number, values padded to the header)]); rows that are entirely empty are skipped.
+        Every load is kept, so that a later read with a ``max_age`` can reuse it."""
         with self._lock:
-            hit = self._cache.get(table)
-            if not fresh and hit and time.monotonic() - hit[0] < self.cache_seconds:
-                return hit[1], hit[2]
+            hit = self._cached(table, max_age)
+            if hit is not None:
+                return hit
             if not self._has_table(table):
                 raise KitError("storage.missing_table", table=table)
             raw = [[cell(v) for v in r] for r in self._read_values(table)]
-            header = list(raw[0]) if raw else []
-            while header and not header[-1].strip():
-                header.pop()
-            if not header or any(not c.strip() for c in header) or len(set(header)) != len(header):
-                raise KitError("storage.bad_header", table=table)
+            header = self._clean_header(table, raw[0] if raw else [])
             rows = []
             for number, values in enumerate(raw[1:], start=2):
                 values = (values + [""] * len(header))[:len(header)]
                 if any(v.strip() for v in values):
                     rows.append((number, values))
-            if self.cache_seconds > 0:
-                self._cache[table] = (time.monotonic(), header, rows)
+            self._cache[table] = (time.monotonic(), header, rows)
             return header, rows
 
-    def _check_known(self, table: str, columns: Iterable[str], header: list[str] | None = None) -> None:
-        header = header if header is not None else self.columns(table)
+    def _append_row(self, table: str, header: list[str], row: dict) -> dict[str, str]:
+        self._check_known(table, row, header)
+        values = [cell(row.get(c)) for c in header]
+        self._append_values(table, values)
+        self._cache.pop(table, None)
+        return dict(zip(header, values, strict=True))
+
+    @staticmethod
+    def _check_required(table: str, header: list[str], columns: Iterable[str]) -> None:
+        missing = [c for c in columns if c not in header]
+        if missing:
+            raise KitError("storage.missing_columns", table=table, columns=", ".join(missing))
+
+    def _check_known(self, table: str, columns: Iterable[str], header: list[str]) -> None:
         unknown = [c for c in columns if c not in header]
         if unknown:
             raise KitError("storage.unknown_columns", table=table, columns=", ".join(unknown))
 
-    def _values(self, table: str, header: list[str], row: dict) -> list[str]:
-        self._check_known(table, row, header)
-        return [cell(row.get(c)) for c in header]
-
     # ----------------------------------------------------------------------------------------- primitives
     def _has_table(self, table: str) -> bool:
         return table in self.table_names()
+
+    def _read_header(self, table: str) -> list:
+        """The first row of the table; backends that can read one row more cheaply override this."""
+        rows = self._read_values(table)
+        return list(rows[0]) if rows else []
 
     @abstractmethod
     def table_names(self) -> list[str]:
@@ -201,7 +260,8 @@ class Storage(ABC):
 
 
 class MemoryStorage(Storage):
-    """Tables held in memory; ``tables`` maps a table name to its column names (and optionally rows)."""
+    """Tables held in memory; ``tables`` maps a table name to its column names (and optionally rows). Each object
+    holds its own data, so it has its own lock."""
 
     def __init__(self, tables: dict[str, list[str]] | None = None, *, production: bool = False,
                  rows: dict[str, list[dict]] | None = None):
@@ -230,4 +290,5 @@ class MemoryStorage(Storage):
         self._tables[table][number - 1] = list(values)
 
 
-__all__ = ["Storage", "MemoryStorage", "cell", "escape_formula", "require_test_data", "FORMULA_PREFIXES"]
+__all__ = ["Storage", "MemoryStorage", "cell", "escape_formula", "require_test_data", "shared_lock",
+           "FORMULA_PREFIXES"]

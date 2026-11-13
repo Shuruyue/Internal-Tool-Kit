@@ -2,7 +2,8 @@
 
 Every string is written as a text cell, so a value such as ``=HYPERLINK(...)`` typed by a user stays text
 (openpyxl would otherwise store any string that starts with ``=`` as a formula). The workbook is reloaded when the
-file changes on disk, and saved through a temporary file so that an interrupted save cannot corrupt it.
+file changes on disk, and saved through a temporary file so that an interrupted save cannot corrupt it. Storage
+objects of the same file share one lock in the process (keyed by the resolved path).
 """
 
 from __future__ import annotations
@@ -15,7 +16,9 @@ from internal_tool_kit.storage import Storage
 
 class ExcelStorage(Storage):
     def __init__(self, path: str | os.PathLike, *, production: bool = False, cache_seconds: float = 0.0):
-        super().__init__(production=production, cache_seconds=cache_seconds)
+        # storage objects of the same file share one lock in the process
+        super().__init__(production=production, cache_seconds=cache_seconds,
+                         lock_key=("excel", os.path.normcase(str(Path(path).resolve()))))
         self.path = Path(path)
         self._book = None
         self._mtime: int | None = None
