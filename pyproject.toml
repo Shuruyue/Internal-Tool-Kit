@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "internal-tool-kit"
+version = "0.1.0"
+description = "Independent, tested modules for small internal tools: login, sessions, roles, audit log, spreadsheet storage and redaction before AI calls"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Shuruyue" }]
+# the core uses the standard library only; each backend or hasher brings its own dependency
+dependencies = []
+
+[project.optional-dependencies]
+excel = ["openpyxl>=3.1"]
+sheets = ["gspread>=6", "google-auth>=2"]
+bcrypt = ["bcrypt>=4"]
+argon2 = ["argon2-cffi>=23"]
+dev = ["pytest>=8", "openpyxl>=3.1", "gspread>=6", "google-auth>=2", "bcrypt>=4", "argon2-cffi>=23"]
+
+[tool.setuptools.packages.find]
+include = ["internal_tool_kit*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "I", "S"]
+
+[tool.ruff.lint.per-file-ignores]
+# tests use assert and fixed example passwords
+"tests/*" = ["S101", "S105", "S106"]
