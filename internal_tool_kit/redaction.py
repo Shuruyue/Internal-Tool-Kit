@@ -13,8 +13,10 @@ CARD      payment card numbers of 13 to 19 digits that pass the Luhn check
 ========  =====================================================================================================
 
 **Names cannot be found reliably by pattern**, in Chinese or in English. Pass every name the application knows
-(people, clients, projects, addresses) as ``terms``; they are replaced wherever they occur. Anything neither
-detected nor listed is sent as it is: show the user the redacted text before sending when that matters.
+(people, clients, projects, addresses) as ``terms``; they are replaced wherever they occur, ignoring case. A term
+that begins or ends with a Latin letter or digit must stand as a whole word there ("Lin" is not found in "Linux"
+or "Berlin"); Chinese has no spaces between words, so a Chinese term is found inside longer text too. Anything
+neither detected nor listed is sent as it is: show the user the redacted text before sending when that matters.
 
 The same value always becomes the same placeholder (``[EMAIL_1]``), so the model can still tell two people
 apart; placeholders already present in the text are never reused.
@@ -93,6 +95,13 @@ PATTERNS = [
 ]
 
 
+def _term_regex(value: str) -> re.Pattern:
+    """``value`` ignoring case; a Latin letter or digit at either end must not continue into the text around it."""
+    before = _NOT_ALNUM_BEFORE if value[0].isascii() and value[0].isalnum() else ""
+    after = _NOT_ALNUM_AFTER if value[-1].isascii() and value[-1].isalnum() else ""
+    return re.compile(before + re.escape(value) + after, re.IGNORECASE)
+
+
 @dataclass
 class Redacted:
     """The text to send, and how to turn placeholders back into the originals."""
@@ -117,21 +126,18 @@ class Redactor:
         """``terms``: kind -> known values, for example ``{"NAME": ["王小明", "Lin Mei"], "CLIENT": ["Acme"]}``.
         Kinds are upper-case letters; values are matched ignoring case, the longest first."""
         self.patterns = list(patterns)
-        self.terms: list[tuple[str, str]] = []
+        terms_found: list[tuple[str, str]] = []
         for kind, values in (terms or {}).items():
             if not re.fullmatch(r"[A-Z]+", kind):
                 raise ValueError(f"term kind {kind!r} must be upper-case letters")
-            self.terms += [(kind, v) for v in values if v and v.strip()]
-        self.terms.sort(key=lambda kv: -len(kv[1]))
+            terms_found += [(kind, v.strip()) for v in values if v and v.strip()]
+        terms_found.sort(key=lambda kv: -len(kv[1]))
+        self.terms: list[tuple[str, re.Pattern]] = [(kind, _term_regex(v)) for kind, v in terms_found]
 
     def _spans(self, text: str) -> list[tuple[int, int, str]]:
         found = []
-        lowered = text.lower()
-        for kind, value in self.terms:
-            start, needle = 0, value.lower()
-            while (i := lowered.find(needle, start)) >= 0:
-                found.append((i, i + len(value), kind))
-                start = i + len(value)
+        for kind, regex in self.terms:       # matched on the text itself: lower() may change its length
+            found += [(m.start(), m.end(), kind) for m in regex.finditer(text)]
         for p in self.patterns:
             for m in p.regex.finditer(text):
                 s, e = m.span(p.group)

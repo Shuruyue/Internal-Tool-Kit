@@ -113,3 +113,19 @@ def test_prepare_then_send_lets_a_person_check_what_leaves():
     provider = Recorder("Asked [EMAIL_1].")
     assert ai.send(provider, out).text == "Asked anna@example.com."
     assert provider.calls == [("Ask [EMAIL_1]", None)]
+
+
+def test_characters_that_change_length_in_lower_case_do_not_shift_the_match():
+    r = Redactor({"NAME": ["王小明"]}).redact("İİ 王小明 來了")              # "İ".lower() has two characters
+    assert r.text == "İİ [NAME_1] 來了" and r.mapping == {"[NAME_1]": "王小明"}
+
+
+@pytest.mark.parametrize("text, found", [("Lin, please call", True), ("ask LIN.", True), ("(Lin)", True),
+                                         ("Linux server", False), ("Berlin office", False), ("Lin2", False)])
+def test_latin_terms_match_whole_words_only(text, found):
+    assert (Redactor({"NAME": ["Lin"]}).redact(text).kinds == {"NAME": 1}) is found
+
+
+def test_chinese_terms_match_inside_longer_text():
+    assert Redactor({"NAME": ["小明"]}).redact("請王小明回覆").text == "請王[NAME_1]回覆"
+    assert Redactor({"CLIENT": ["台灣Acme"]}).redact("台灣Acme公司").text == "[CLIENT_1]公司"
