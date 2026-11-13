@@ -34,5 +34,5 @@ line-length = 120
 select = ["E", "F", "W", "B", "UP", "I", "S"]
 
 [tool.ruff.lint.per-file-ignores]
-# tests use assert and fixed example passwords
-"tests/*" = ["S101", "S105", "S106"]
+# tests use assert, fixed example passwords and seeded (non-cryptographic) random numbers
+"tests/*" = ["S101", "S105", "S106", "S311"]
