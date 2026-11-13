@@ -80,6 +80,12 @@ class Storage(ABC):
         self._lock = threading.RLock()
         self._cache: dict[str, tuple[float, list[str], list[tuple[int, list[str]]]]] = {}
 
+    @property
+    def lock(self) -> threading.RLock:
+        """The storage's lock (re-entrant). Hold it around a read-check-write sequence of your own, such as
+        "the username is free, then insert", so that no other write of this process comes in between."""
+        return self._lock
+
     # ----------------------------------------------------------------------------------------- reading
     def columns(self, table: str) -> list[str]:
         return list(self._load(table, fresh=False)[0])
