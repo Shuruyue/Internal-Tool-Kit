@@ -48,15 +48,15 @@ def test_setting_a_password_increases_the_version(store):
 
 
 def test_break_glass_reset_gives_a_one_time_password_ends_sessions_and_can_reenable(store):
-    a = store.create("boss", "Boss", "owner", passwords.hash_password("river7stone"), must_change_password=False)
+    a = store.create("head", "Head", "owner", passwords.hash_password("river7stone"), must_change_password=False)
     store.update(a.account_id, active=False)
     throttle = LoginThrottle(attempts=1)
-    throttle.failure("boss")
-    account, temp = reset_password(store, "Boss", enable=True, throttle=throttle)
+    throttle.failure("head")
+    account, temp = reset_password(store, "Head", enable=True, throttle=throttle)
     assert passwords.verify_password(temp, account.password_hash)
     assert not passwords.verify_password("river7stone", account.password_hash)
     assert (account.active, account.must_change_password, account.password_version) == (True, True, 2)
-    assert not throttle.is_paused("boss")
+    assert not throttle.is_paused("head")
     with pytest.raises(KitError) as exc:
         reset_password(store, "nobody")
     assert exc.value.key == "accounts.not_found"

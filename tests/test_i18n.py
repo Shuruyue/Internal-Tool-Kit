@@ -64,10 +64,15 @@ def test_error_carries_key_and_renders_in_any_language(sample_key):
 
 
 def test_every_registered_message_has_both_languages_with_the_same_fields():
+    import importlib
+    import pkgutil
     import string
 
-    import internal_tool_kit  # noqa: F401  (modules register their messages on import)
+    import internal_tool_kit
 
+    for info in pkgutil.walk_packages(internal_tool_kit.__path__, "internal_tool_kit."):
+        importlib.import_module(info.name)               # modules register their messages on import
+    assert len([k for k in i18n.MESSAGES if not k.startswith("test.")]) >= 25
     for key, langs in i18n.MESSAGES.items():
         assert set(langs) == set(i18n.LANGUAGES), key
         fields = {lang: {f for _, f, _, _ in string.Formatter().parse(t) if f} for lang, t in langs.items()}
