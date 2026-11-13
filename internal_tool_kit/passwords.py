@@ -1,7 +1,11 @@
 """Password hashing and the password policy.
 
-The default hasher is scrypt from the standard library, with the parameters OWASP recommends (N = 2^17, r = 8,
-p = 1: 128 MiB and a few hundred milliseconds per hash), so nothing has to be installed. bcrypt and Argon2id are
+The default hasher is scrypt from the standard library, so nothing has to be installed, with N = 2^15, r = 8,
+p = 3: one of the settings the OWASP Password Storage Cheat Sheet lists as giving the same minimum defence as
+N = 2^17, r = 8, p = 1, trading memory for time. It needs 32 MiB per hash instead of 128 MiB, which matters on a
+small server: every login attempt, including one for an unknown username, computes a hash, so eight attempts at
+once would take 1 GiB with the other setting. Hashes made with other parameters still verify, and
+:func:`needs_rehash` replaces them at the next login. bcrypt and Argon2id are
 available as alternatives (``pip install internal-tool-kit[bcrypt]`` or ``[argon2]``), for example to keep the
 hashes of an existing user table. :func:`verify_password` recognizes all three formats, so a table can hold a mix
 while it migrates: after a successful login, :func:`needs_rehash` says when to store a new hash.
@@ -47,12 +51,15 @@ def _unb64(text: str) -> bytes:
     return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
 
 
+MAX_SCRYPT_MEMORY = 2 ** 28      # 256 MiB: twice OWASP's largest setting; anything above comes from a tampered row
+
+
 class ScryptHasher:
     """scrypt from hashlib. Stored as ``scrypt$N$r$p$salt$hash`` (base64url)."""
 
     prefix = "scrypt$"
 
-    def __init__(self, n: int = 2 ** 17, r: int = 8, p: int = 1, salt_bytes: int = 16, length: int = 32):
+    def __init__(self, n: int = 2 ** 15, r: int = 8, p: int = 3, salt_bytes: int = 16, length: int = 32):
         self.n, self.r, self.p, self.salt_bytes, self.length = n, r, p, salt_bytes, length
 
     @staticmethod
@@ -73,7 +80,7 @@ class ScryptHasher:
     def verify(self, password: str, stored: str) -> bool:
         try:
             n, r, p, salt, key = self._parse(stored)
-            if n > 2 ** 20 or r > 32 or p > 16:          # refuse parameters that would exhaust memory
+            if 128 * r * n > MAX_SCRYPT_MEMORY or p > 16:   # refuse parameters that would exhaust memory
                 return False
             return hmac.compare_digest(self._derive(password, salt, n, r, p, len(key)), key)
         except (ValueError, TypeError):
@@ -173,8 +180,9 @@ def hash_password(password: str, hasher: Hasher | None = None) -> str:
 
 
 def verify_password(password: str, stored: str, hashers: tuple = ()) -> bool:
-    """Whether ``password`` matches ``stored`` in any known format; False (never an exception) for an empty or
-    unrecognized hash, so a malformed row cannot be used to log in."""
+    """Whether ``password`` matches ``stored`` in any known format; False (never an exception) for an empty,
+    malformed or unrecognized hash, so a bad row cannot be used to log in. A bcrypt or Argon2 hash whose library is
+    not installed raises ``ImportError``: a configuration error is reported, not turned into "wrong password"."""
     if not stored:
         return False
     h = _hasher_for(stored, (*hashers, DEFAULT_HASHER))

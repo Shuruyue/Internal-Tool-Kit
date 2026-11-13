@@ -9,11 +9,11 @@ from internal_tool_kit.passwords import Argon2Hasher, BcryptHasher, ScryptHasher
 from .conftest import FAST
 
 
-def test_default_scrypt_parameters_are_owasps_and_a_default_hash_round_trips():
+def test_default_scrypt_parameters_are_an_owasp_setting_and_a_default_hash_round_trips():
     default = ScryptHasher()
-    assert (default.n, default.r, default.p) == (2 ** 17, 8, 1)
+    assert (default.n, default.r, default.p) == (2 ** 15, 8, 3)       # OWASP: same defence as 2^17, 8, 1; 32 MiB
     stored = default.hash("correct horse 1")
-    assert stored.startswith("scrypt$131072$8$1$")
+    assert stored.startswith("scrypt$32768$8$3$")
     assert default.verify("correct horse 1", stored)
     assert not default.verify("correct horse 2", stored)
 
@@ -86,3 +86,14 @@ def test_temporary_passwords_meet_the_policy_and_avoid_confusable_characters():
         assert not set(pw) & set("IlO01")
         seen.add(pw)
     assert len(seen) == 200
+
+
+def test_hashes_made_with_the_former_default_still_verify_and_are_upgraded():
+    old = ScryptHasher(n=2 ** 17, r=8, p=1).hash("correct horse 1")
+    assert passwords.verify_password("correct horse 1", old)
+    assert passwords.needs_rehash(old, ScryptHasher())
+
+
+def test_a_hash_asking_for_more_than_256_mib_is_refused():
+    stored = FAST.hash("pw12345678").replace("scrypt$1024$8$", "scrypt$1024$4096$")    # 512 MiB
+    assert not passwords.verify_password("pw12345678", stored)

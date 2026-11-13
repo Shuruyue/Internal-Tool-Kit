@@ -128,3 +128,71 @@ def test_password_change_checks_the_current_password_and_the_policy(store):
     changed = store.set_password(anna.account_id, new_hash, must_change_password=False)
     assert changed.password_version == anna.password_version + 1
     assert passwords.verify_password("new9password", changed.password_hash)
+
+
+def test_failures_are_forgotten_after_the_pause_length(store, clock):
+    t = LoginThrottle(attempts=3, minutes=15, clock=clock)
+    for _ in range(2):
+        with pytest.raises(KitError):
+            attempt(store, t, "anna", "wrong1pass")
+    clock.now += 15 * 60
+    with pytest.raises(KitError):
+        attempt(store, t, "anna", "wrong1pass")
+    assert not t.is_paused("anna")                      # 1 recent failure, not 3
+
+
+def test_expired_entries_are_cleaned_as_the_table_grows(store, clock):
+    t = LoginThrottle(attempts=5, minutes=15, clock=clock)
+    for i in range(3000):
+        t.failure(f"nobody{i}")
+        clock.now += 1                                  # spread over 50 minutes
+    assert len(t.store) < 2000                          # the oldest names were dropped
+    clock.now += 15 * 60
+    assert t.prune() > 0 and t.store == {}
+
+
+def test_a_username_cannot_be_used_to_pause_a_client(store, clock):
+    t = LoginThrottle(attempts=1, client_attempts=1, clock=clock)
+    with pytest.raises(KitError):
+        attempt(store, t, "client:10.0.0.9", "x")
+    assert not t.is_paused("someone", client="10.0.0.9")
+
+
+def test_one_client_trying_many_usernames_is_paused(store, clock):
+    t = LoginThrottle(attempts=5, client_attempts=3, clock=clock)
+    for name in ("u1", "u2", "u3"):                     # one guess each: no username reaches its limit
+        with pytest.raises(KitError):
+            authenticate(name, "Summer2026", find_account=store.find_by_username, throttle=t, client="10.0.0.9")
+    with pytest.raises(KitError) as exc:                # even a right password from that client, same answer
+        authenticate("anna", "river7stone", find_account=store.find_by_username, throttle=t, client="10.0.0.9")
+    assert exc.value.key == "login.invalid"
+    assert authenticate("anna", "river7stone", find_account=store.find_by_username, throttle=t, client="10.0.0.7")
+    t.unlock_client("10.0.0.9")
+    assert authenticate("anna", "river7stone", find_account=store.find_by_username, throttle=t, client="10.0.0.9")
+
+
+def test_a_success_does_not_clear_the_clients_count(store, clock):
+    t = LoginThrottle(attempts=5, client_attempts=2, clock=clock)
+    with pytest.raises(KitError):
+        authenticate("u1", "x", find_account=store.find_by_username, throttle=t, client="c")
+    authenticate("anna", "river7stone", find_account=store.find_by_username, throttle=t, client="c")
+    with pytest.raises(KitError):
+        authenticate("u2", "x", find_account=store.find_by_username, throttle=t, client="c")
+    assert t.is_paused("anyone", client="c")
+
+
+def test_wrong_current_passwords_pause_password_changes(store, clock):
+    anna = store.find_by_username("anna")
+    t = LoginThrottle(attempts=3, minutes=15, clock=clock)
+    for _ in range(3):
+        with pytest.raises(KitError) as exc:
+            login.new_password_hash(anna, "guess1pass", "new9password", throttle=t)
+        assert exc.value.key == "password.current_wrong"
+    with pytest.raises(KitError) as exc:                # paused: even the right password waits
+        login.new_password_hash(anna, "river7stone", "new9password", throttle=t)
+    assert exc.value.key == "login.change_paused"
+    assert exc.value.text("zh-TW") == "目前密碼輸入錯誤次數過多，請 15 分鐘後再試。"
+    assert not t.is_paused("anna")                      # signing in is a separate count
+    clock.now += 15 * 60
+    assert login.new_password_hash(anna, "river7stone", "new9password", throttle=t)
+    assert t.store == {}
